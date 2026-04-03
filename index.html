@@ -1,52 +1,50 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>IPTV Player (Custom URL)</title>
-<style>
-body { margin:0; background:#000; color:#fff; font-family:Arial; }
-#controls { position:absolute; top:10px; left:10px; z-index:1000; }
-#video { width:100vw; height:100vh; background:#000; margin-top:50px; }
-#menu { position:absolute; top:50px; left:50px; z-index:1000; display:none; background:rgba(0,0,0,0.7); padding:10px; max-height:80vh; overflow-y:auto; }
-.menu-item { padding:5px 10px; cursor:pointer; }
-.menu-item.active { background:#ffaa00; color:#000; }
-#msg { position:absolute; top:50px; left:10px; z-index:1000; color:#0f0; font-size:18px; }
-</style>
-</head>
-<body>
-
-<div id="controls">
-  <input type="text" id="m3uurl" placeholder="Masukkan URL M3U" size="50">
-  <button id="loadBtn">Load Playlist</button>
-</div>
-
-<video id="video" controls muted autoplay></video>
-<div id="menu"></div>
-<div id="msg"></div>
-
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
 let playlistData = [];
 let currentIndex = 0;
 let retryCount = 0;
 const MAX_RETRY = 3;
-const RETRY_DELAY = 5000; // 5 detik
+const RETRY_DELAY = 5000;
 
 const video = document.getElementById("video");
 const menu = document.getElementById("menu");
 const msg = document.getElementById("msg");
 const m3uInput = document.getElementById("m3uurl");
 const loadBtn = document.getElementById("loadBtn");
+
 let hls = null;
 let menuActive = false;
 
-function showMessage(text) { msg.textContent = text; }
+const CORS_PROXY = "https://api.allorigins.win/raw?url=";
 
-// --- Load playlist dari user input ---
+function showMessage(text) {
+  console.log(text);
+  msg.textContent = text;
+}
+
+// --- FORCE HTTPS ---
+function forceHTTPS(url) {
+  if (url.startsWith("http://")) {
+    return url.replace("http://", "https://");
+  }
+  return url;
+}
+
+// --- Load playlist ---
 async function loadPlaylist(url) {
   try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error("Gagal fetch playlist");
+    showMessage("Loading playlist...");
+
+    // try direct first
+    let res;
+    try {
+      res = await fetch(url);
+      if (!res.ok) throw new Error();
+    } catch {
+      showMessage("Direct fetch failed, trying proxy...");
+      res = await fetch(CORS_PROXY + encodeURIComponent(url));
+    }
+
     const text = await res.text();
 
     const lines = text.split("\n");
@@ -58,59 +56,92 @@ async function loadPlaylist(url) {
       if (line.startsWith("#EXTINF")) {
         title = line.split(",")[1] || "Channel";
       } else if (line && line.startsWith("http")) {
-        playlistData.push({ url: line, title: title });
+        playlistData.push({ 
+          url: forceHTTPS(line), 
+          title: title 
+        });
       }
     });
 
     if (!playlistData.length) throw new Error("Playlist kosong");
-    showMessage("Playlist loaded (" + playlistData.length + " channels)");
-    playChannel(currentIndex);
+
+    showMessage("Loaded " + playlistData.length + " channels");
+    playChannel(0);
 
   } catch(e) {
-    showMessage(e.message);
+    showMessage("Error: " + e.message);
   }
 }
 
-// --- Play channel dengan retry ---
+// --- Play channel ---
 function playChannel(index) {
   if (!playlistData.length) return;
+
   currentIndex = index;
   retryCount = 0;
+
   const url = playlistData[currentIndex].url;
   showMessage("Playing: " + playlistData[currentIndex].title);
 
-  if (hls) { hls.destroy(); hls = null; }
+  if (hls) {
+    hls.destroy();
+    hls = null;
+  }
 
   const startPlayback = () => {
+    console.log("Trying stream:", url);
+
     if (Hls.isSupported()) {
-      hls = new Hls();
+      hls = new Hls({
+        debug: false
+      });
+
       hls.loadSource(url);
       hls.attachMedia(video);
+
       hls.on(Hls.Events.ERROR, (event, data) => {
-        if (retryCount < MAX_RETRY) {
-          retryCount++;
-          showMessage(`Stream error, retry ${retryCount}/${MAX_RETRY} in 5s...`);
-          setTimeout(startPlayback, RETRY_DELAY);
-        } else {
-          showMessage("Stream failed, skipping to next channel...");
-          nextChannel();
+        console.error("HLS error:", data);
+
+        if (data.fatal) {
+          switch(data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              showMessage("Network error, retrying...");
+              hls.startLoad();
+              break;
+
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              showMessage("Media error, recovering...");
+              hls.recoverMediaError();
+              break;
+
+            default:
+              retryOrNext();
+              break;
+          }
         }
       });
-    } else {
+
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
       video.src = url;
-      video.onerror = () => {
-        if (retryCount < MAX_RETRY) {
-          retryCount++;
-          showMessage(`Video error, retry ${retryCount}/${MAX_RETRY} in 5s...`);
-          setTimeout(startPlayback, RETRY_DELAY);
-        } else {
-          showMessage("Video failed, skipping to next channel...");
-          nextChannel();
-        }
-      };
+    } else {
+      showMessage("HLS not supported");
     }
-    video.play().catch(err => console.warn(err));
+
+    video.play().catch(err => {
+      console.warn("Play error:", err);
+    });
   };
+
+  function retryOrNext() {
+    if (retryCount < MAX_RETRY) {
+      retryCount++;
+      showMessage(`Retry ${retryCount}/${MAX_RETRY}...`);
+      setTimeout(startPlayback, RETRY_DELAY);
+    } else {
+      showMessage("Failed → Next channel");
+      nextChannel();
+    }
+  }
 
   startPlayback();
 }
@@ -140,8 +171,16 @@ function renderMenu() {
   });
 }
 
-function showMenu() { menuActive = true; menu.style.display = "block"; renderMenu(); }
-function hideMenu() { menuActive = false; menu.style.display = "none"; }
+function showMenu() {
+  menuActive = true;
+  menu.style.display = "block";
+  renderMenu();
+}
+
+function hideMenu() {
+  menuActive = false;
+  menu.style.display = "none";
+}
 
 // --- Keyboard ---
 document.addEventListener("keydown", e => {
@@ -149,23 +188,21 @@ document.addEventListener("keydown", e => {
     if (e.key === "Escape") hideMenu();
     return;
   }
+
   switch(e.key) {
     case "ArrowRight": nextChannel(); break;
     case "ArrowLeft": prevChannel(); break;
     case "ArrowDown": showMenu(); break;
-    case "r": {
+    case "r":
       const url = m3uInput.value.trim();
       if (url) loadPlaylist(url);
-    } break;
+      break;
   }
 });
 
-// --- Button Load ---
+// --- Button ---
 loadBtn.onclick = () => {
   const url = m3uInput.value.trim();
   if (url) loadPlaylist(url);
 };
 </script>
-
-</body>
-</html>
